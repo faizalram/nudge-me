@@ -1,9 +1,10 @@
 "use client";
 
-import { useCallback, useEffect, useMemo, useState, type FormEvent } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState, type FormEvent } from "react";
 import { useRouter } from "next/navigation";
 import { parseNudge } from "@/lib/parse";
 import { formatDue, formatIn, fromLocalStamp, localStamp } from "@/lib/format";
+import { playChime, unlockAudio } from "@/lib/chime";
 import {
   api,
   ApiError,
@@ -78,7 +79,9 @@ export default function Home() {
 }
 
 function addMinutes(min: number) {
-  return new Date(Date.now() + min * 60_000);
+  const d = new Date(Date.now() + min * 60_000);
+  d.setSeconds(d.getSeconds() >= 30 ? 60 : 0, 0); // land on a whole minute
+  return d;
 }
 
 function tomorrowAt(hour: number) {
@@ -105,13 +108,21 @@ function Main({ me, onSignedOut }: { me: Me; onSignedOut: () => void }) {
   const [perm, setPerm] = useState<NotificationPermission | "unsupported">("unsupported");
 
   const parsed = useMemo(() => parseNudge(input, now), [input, now]);
+  // fireCount of each ringing nudge at the last refresh; null until the first load
+  const seenRef = useRef<Map<string, number> | null>(null);
 
   const refresh = useCallback(async () => {
     try {
       const r = await api<{ nudges: Nudge[] }>("/api/nudges");
+      const firing = r.nudges.filter((n) => n.status === "firing");
+      // Chime when a nudge starts ringing or re-nudges while the app is open.
+      // Skipped on the first load, so opening the app from a notification stays quiet.
+      const seen = seenRef.current;
+      if (seen && firing.some((n) => (seen.get(n.id) ?? 0) < n.fireCount)) playChime();
+      seenRef.current = new Map(firing.map((n) => [n.id, n.fireCount]));
       setNudges(r.nudges);
       setLoaded(true);
-      setBadge(r.nudges.filter((n) => n.status === "firing").length);
+      setBadge(firing.length);
     } catch (e) {
       if (e instanceof ApiError && e.status === 401) onSignedOut();
     }
@@ -119,7 +130,7 @@ function Main({ me, onSignedOut }: { me: Me; onSignedOut: () => void }) {
 
   useEffect(() => {
     refresh();
-    const tick = setInterval(() => setNow(new Date()), 15_000);
+    const tick = setInterval(() => setNow(new Date()), 1_000);
     const poll = setInterval(refresh, 30_000);
     const onVisible = () => {
       if (document.visibilityState === "visible") {
@@ -134,6 +145,27 @@ function Main({ me, onSignedOut }: { me: Me; onSignedOut: () => void }) {
       document.removeEventListener("visibilitychange", onVisible);
     };
   }, [refresh]);
+
+  // iOS only allows sound after a tap, so every tap re-arms the chime
+  useEffect(() => {
+    const unlock = () => unlockAudio();
+    const events = ["touchend", "click", "keydown"] as const;
+    events.forEach((e) => window.addEventListener(e, unlock));
+    return () => events.forEach((e) => window.removeEventListener(e, unlock));
+  }, []);
+
+  // Pull the list again a few seconds after the next nudge is due
+  useEffect(() => {
+    const next = nudges
+      .filter((n) => n.status === "pending")
+      .map((n) => new Date(n.dueAt).getTime())
+      .sort((a, b) => a - b)[0];
+    if (!next) return;
+    const wait = next - Date.now() + 4_000;
+    if (wait > 30_000) return; // the 30 s poll covers it
+    const t = setTimeout(refresh, Math.max(wait, 1_000));
+    return () => clearTimeout(t);
+  }, [nudges, refresh]);
 
   useEffect(() => {
     if (!pushSupported()) return;
@@ -242,7 +274,7 @@ function Main({ me, onSignedOut }: { me: Me; onSignedOut: () => void }) {
   } else {
     preview = (
       <span className="muted">
-        {me.smartParse ? "No time found yet. Press Enter to read it, or tap a time." : "Add a time, or tap one below."}
+        {me.smartParse ? "No time found yet. Tap Set to read it, or tap a time below." : "Add a time, or tap one below."}
       </span>
     );
   }
@@ -273,22 +305,27 @@ function Main({ me, onSignedOut }: { me: Me; onSignedOut: () => void }) {
       )}
 
       <form className="composer" onSubmit={onSubmit}>
-        <input
-          aria-label="What should we nudge you about, and when?"
-          placeholder="Bayar listrik besok jam 9"
-          value={input}
-          onChange={(e) => {
-            setInput(e.target.value);
-            setNow(new Date());
-            setError("");
-            setNotice("");
-          }}
-          enterKeyHint="send"
-          autoComplete="off"
-          autoCorrect="off"
-          maxLength={280}
-          disabled={busy}
-        />
+        <div className="composer-row">
+          <input
+            aria-label="What should we nudge you about, and when?"
+            placeholder="Rapat jam 3"
+            value={input}
+            onChange={(e) => {
+              setInput(e.target.value);
+              setNow(new Date());
+              setError("");
+              setNotice("");
+            }}
+            enterKeyHint="send"
+            autoComplete="off"
+            autoCorrect="off"
+            maxLength={280}
+            disabled={busy}
+          />
+          <button type="submit" className="btn btn-set" disabled={busy || !input.trim()}>
+            {busy ? "Setting" : "Set"}
+          </button>
+        </div>
         <p className="preview" aria-live="polite">
           {preview}
         </p>
