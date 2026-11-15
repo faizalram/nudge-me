@@ -1,7 +1,7 @@
 // Rule-based time parser for mixed Bahasa Indonesia + English nudges.
 // Runs in the browser, so the preview is instant and free.
 // Examples: "rapat jam 3", "bayar listrik besok jam 9", "call mom at 3pm",
-// "minum obat 30 menit lagi", "in 20 min check oven", "jumat sore kirim laporan".
+// "minum obat 30 menit lagi", "angkat mie 3 menit 30 detik lagi", "in 45 sec", "in 20 min check oven", "jumat sore kirim laporan".
 
 export type Parsed = { text: string; due: Date | null };
 
@@ -62,7 +62,9 @@ const RE = {
   relHM: new RegExp(String.raw`(?:\bin\s+)?\b(\d{1,2})\s*(?:jam|hours?|hrs?|h)\s*(\d{1,2})\s*(?:menit|mnt|minutes?|mins?|m)\b(?:\s+lagi\b)?`, "g"),
   relHalf: /(?:\bin\s+)?\b(?:setengah\s+jam|half\s+an?\s+hour)\b(?:\s+lagi\b)?/g,
   relHour1: /\bin\s+an?\s+hour\b|\bsejam(?:\s+lagi)?\b/g,
+  relMS: /(?:\bin\s+)?\b(\d{1,3})\s*(?:menit|mnt|minutes?|mins?|m)\s*(\d{1,3})\s*(?:detik|dtk|seconds?|secs?|s)\b(?:\s+lagi\b)?/g,
   relMin: /(?:\bin\s+)?\b(\d{1,4})\s*(?:menit|mnt|minutes?|mins?|m)\b(?:\s+lagi\b)?/g,
+  relSec: /(?:\bin\s+)?\b(\d{1,5})\s*(?:detik|dtk|seconds?|secs?|s)\b(?:\s+lagi\b)?/g,
   relHour: /\bin\s+(\d{1,3})\s*(?:jam|hours?|hrs?|h)\b|\b(\d{1,3})\s*(?:jam|hours?|hrs?|h)\s+lagi\b|\b(\d{1,3})\s*(?:hours?|hrs?|h)\b/g,
   relDays: /\bin\s+(\d{1,2})\s*days?\b|\b(\d{1,2})\s*(?:hari|days?)\s+lagi\b/g,
   relWeeks: /\bin\s+(\d{1,2})\s*weeks?\b|\b(\d{1,2})\s*(?:minggu|pekan|weeks?)\s+lagi\b/g,
@@ -147,23 +149,26 @@ export function parseNudge(input: string, now: Date = new Date()): Parsed {
   const s = new Scanner(input);
 
   type State = {
-    relMin: number;
+    relSec: number;
     hasRel: boolean;
+    exact: boolean;
     dayOffset: number | null;
     weekday: { dow: number; strict: boolean } | null;
     abs: { d: number; mo: number | null; y: number | null } | null;
     time: { h: number; m: number; mod: string | null } | null;
     part: string | null;
   };
-  const st: State = { relMin: 0, hasRel: false, dayOffset: null, weekday: null, abs: null, time: null, part: null };
+  const st: State = { relSec: 0, hasRel: false, exact: false, dayOffset: null, weekday: null, abs: null, time: null, part: null };
   const dateSet = () => st.dayOffset !== null || st.weekday !== null || st.abs !== null;
 
-  // 1. Relative times ("30 menit lagi", "in 2 hours", "1 jam 30 menit lagi")
-  s.take(RE.relHM, (m) => { st.relMin += +m[1] * 60 + +m[2]; st.hasRel = true; });
-  s.take(RE.relHalf, () => { st.relMin += 30; st.hasRel = true; });
-  s.take(RE.relHour1, () => { st.relMin += 60; st.hasRel = true; });
-  s.take(RE.relMin, (m) => { st.relMin += +m[1]; st.hasRel = true; });
-  s.take(RE.relHour, (m) => { st.relMin += +(m[1] ?? m[2] ?? m[3]) * 60; st.hasRel = true; });
+  // 1. Relative times ("30 detik lagi", "30 menit lagi", "in 2 hours", "1 jam 30 menit lagi")
+  s.take(RE.relHM, (m) => { st.relSec += (+m[1] * 60 + +m[2]) * 60; st.hasRel = true; });
+  s.take(RE.relHalf, () => { st.relSec += 30 * 60; st.hasRel = true; });
+  s.take(RE.relHour1, () => { st.relSec += 60 * 60; st.hasRel = true; });
+  s.take(RE.relMS, (m) => { st.relSec += +m[1] * 60 + +m[2]; st.hasRel = true; st.exact = true; });
+  s.take(RE.relMin, (m) => { st.relSec += +m[1] * 60; st.hasRel = true; });
+  s.take(RE.relSec, (m) => { st.relSec += +m[1]; st.hasRel = true; st.exact = true; });
+  s.take(RE.relHour, (m) => { st.relSec += +(m[1] ?? m[2] ?? m[3]) * 3600; st.hasRel = true; });
 
   // 2. Relative days ("3 hari lagi", "2 minggu lagi", "in 3 days")
   s.take(RE.relDays, (m) => { if (dateSet()) return false; st.dayOffset = +(m[1] ?? m[2]); });
@@ -240,7 +245,13 @@ export function parseNudge(input: string, now: Date = new Date()): Parsed {
 
   const text = cleanText(s.rest());
 
-  if (st.hasRel) return { text, due: new Date(now.getTime() + st.relMin * 60_000) };
+  if (st.hasRel) {
+    const due = new Date(now.getTime() + st.relSec * 1000);
+    // Seconds given: keep them. Otherwise land on a whole minute.
+    if (!st.exact) due.setSeconds(due.getSeconds() >= 30 ? 60 : 0, 0);
+    else due.setMilliseconds(0);
+    return { text, due };
+  }
 
   // Resolve the date
   const today = startOfDay(now);
